@@ -1,0 +1,289 @@
+// Copyright 2011 Juri Glass, Mathias Runge, Nadim El Sayed
+// DAI-Labor, TU-Berlin
+//
+// This file is part of libSML.
+// Thanks to Thomas Binder and Axel (tuxedo) for providing code how to
+// print OBIS data (see transport_receiver()).
+// https://community.openhab.org/t/using-a-power-meter-sml-with-openhab/21923
+//
+// libSML is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// libSML is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with libSML.  If not, see <http://www.gnu.org/licenses/>.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <ctype.h>
+#include <errno.h>
+#include <termios.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+#include <sys/ioctl.h>
+#include <json/json.h>
+#include <curl/curl.h>
+
+#include <sml/sml_file.h>
+#include <sml/sml_transport.h>
+#include <sml/sml_value.h>
+
+#include "unit.h"
+#include "hec_key.h"	// keys not going to github
+
+// globals
+int sflag = false; // flag to process only a single OBIS data stream
+int vflag = false; // verbose flag
+
+struct WriteThis {
+	const char *readptr;
+	size_t sizeleft;
+};
+
+#ifdef PROVIDE_READ_CALLBACK
+static size_t read_callback(void *dest, size_t size, size_t nmemb, void *userp)
+{
+	struct WriteThis *wt = (struct WriteThis *)userp;
+	size_t buffer_size = size*nmemb;
+
+	if(wt->sizeleft) {
+		/* copy as much as possible from the source to the destination */ 
+		size_t copy_this_much = wt->sizeleft;
+		if(copy_this_much > buffer_size)
+		copy_this_much = buffer_size;
+		memcpy(dest, wt->readptr, copy_this_much);
+
+		wt->readptr += copy_this_much;
+		wt->sizeleft -= copy_this_much;
+		return copy_this_much; /* we copied this many bytes */ 
+	}
+
+	printf("%s\n", wt->readptr);
+	return 0; /* no more data left to deliver */ 
+}
+#endif
+
+size_t write_callback(__attribute__((unused)) void *buffer,
+	__attribute__((unused)) size_t size,
+	size_t nmemb,
+	__attribute__((unused)) void *userp)
+{
+	return size * nmemb;
+}
+
+int serial_port_open(const char* device) {
+	int bits;
+	struct termios config;
+	memset(&config, 0, sizeof(config));
+
+	if (!strcmp(device, "-"))
+		return 0; // read stdin when "-" is given for the device
+
+#ifdef O_NONBLOCK
+	int fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+#else
+	int fd = open(device, O_RDWR | O_NOCTTY | O_NDELAY);
+#endif
+	if (fd < 0) {
+		fprintf(stderr, "error: open(%s): %s\n", device, strerror(errno));
+		return -1;
+	}
+
+	// set RTS
+	ioctl(fd, TIOCMGET, &bits);
+	bits |= TIOCM_RTS;
+	ioctl(fd, TIOCMSET, &bits);
+
+	tcgetattr(fd, &config);
+
+	// set 8-N-1
+	config.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR
+			| ICRNL | IXON);
+	config.c_oflag &= ~OPOST;
+	config.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+	config.c_cflag &= ~(CSIZE | PARENB | PARODD | CSTOPB);
+	config.c_cflag |= CS8;
+
+	// set speed to 9600 baud
+	cfsetispeed(&config, B9600);
+	cfsetospeed(&config, B9600);
+
+	tcsetattr(fd, TCSANOW, &config);
+	return fd;
+}
+
+void transport_receiver(unsigned char *buffer, size_t buffer_len) {
+	int i;
+	// the buffer contains the whole message, with transport escape sequences.
+	// these escape sequences are stripped here.
+	sml_file *file = sml_file_parse(buffer + 8, buffer_len - 16);
+	// the sml file is parsed now
+
+	// this prints some information about the file
+	if (vflag)
+		sml_file_print(file);
+
+	// read here some values ...
+	if (vflag)
+		printf("OBIS data\n");
+
+	json_object * jroot = json_object_new_object();
+	json_object * jobis = json_object_new_object();
+	json_object_object_add(jroot, "event", jobis);
+
+	for (i = 0; i < file->messages_len; i++) {
+		sml_message *message = file->messages[i];
+		if (*message->message_body->tag == SML_MESSAGE_GET_LIST_RESPONSE) {
+			sml_list *entry;
+			sml_get_list_response *body;
+			body = (sml_get_list_response *) message->message_body->data;
+			for (entry = body->val_list; entry != NULL; entry = entry->next) {
+				if (!entry->value) { // do not crash on null value
+					fprintf(stderr, "Error in data stream. entry->value should not be NULL. Skipping this.\n");
+					continue;
+				}
+				if (entry->value->type == SML_TYPE_OCTET_STRING) {
+					char *str, *obis;
+					asprintf(&obis, "%02x-%02x-%02x-%02x-%02x-%02x",
+						entry->obj_name->str[0], entry->obj_name->str[1],
+						entry->obj_name->str[2], entry->obj_name->str[3],
+						entry->obj_name->str[4], entry->obj_name->str[5]);
+					json_object * jdatastring = json_object_new_string(sml_value_to_strhex(entry->value, &str, true));
+					json_object * jdata = json_object_new_object();
+					json_object_object_add(jdata, "data", jdatastring);
+					json_object_object_add(jobis, obis, jdata);
+					free(str);
+				} else if (entry->value->type == SML_TYPE_BOOLEAN) {
+					printf("%d-%d:%d.%d.%d*%d#%s#\n",
+						entry->obj_name->str[0], entry->obj_name->str[1],
+						entry->obj_name->str[2], entry->obj_name->str[3],
+						entry->obj_name->str[4], entry->obj_name->str[5],
+						entry->value->data.boolean ? "true" : "false");
+				} else if (((entry->value->type & SML_TYPE_FIELD) == SML_TYPE_INTEGER) ||
+						((entry->value->type & SML_TYPE_FIELD) == SML_TYPE_UNSIGNED)) {
+					json_object * jusage = json_object_new_object();
+					double value = sml_value_to_double(entry->value);
+					int scaler = (entry->scaler) ? *entry->scaler : 0;
+					int prec = -scaler;
+					char *obis;
+
+					if (prec < 0)
+						prec = 0;
+					value = value * pow(10, scaler);
+					asprintf(&obis, "%02x-%02x-%02x-%02x-%02x-%02x",
+						entry->obj_name->str[0], entry->obj_name->str[1],
+						entry->obj_name->str[2], entry->obj_name->str[3],
+						entry->obj_name->str[4], entry->obj_name->str[5]);
+					json_object *jvalue = json_object_new_double(value);
+					json_object_object_add(jusage, "Value", jvalue);
+					char *unit = NULL;
+					if (entry->unit &&  // do not crash on null (unit is optional)
+						(unit = dlms_get_unit((unsigned char) *entry->unit)) != NULL) {
+						json_object *junit = json_object_new_string(unit);
+						json_object_object_add(jusage, "Unit", junit);
+					}
+					json_object_object_add(jobis, obis, jusage);
+					// flush the stdout puffer, that pipes work without waiting
+					fflush(stdout);
+				}
+			}
+			if (sflag)
+				exit(0); // processed first message - exit
+		}
+	}
+	// printf("%s\n", json_object_to_json_string(jroot));
+	CURL *curl;
+	curl = curl_easy_init();
+	if (curl) {
+		CURLcode res;
+		struct curl_slist *hdr = NULL;
+		struct WriteThis wt;
+
+		wt.readptr = json_object_to_json_string(jroot);
+		wt.sizeleft = strlen(wt.readptr);
+		hdr = curl_slist_append(hdr, SPLUNK_HEC_KEY);
+		curl_easy_setopt(curl, CURLOPT_URL, "https://192.168.5.201:8443/services/collector");
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, wt.readptr);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, wt.sizeleft);
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+		//curl_easy_setopt(curl, CURLOPT_POST, 1L);
+		//curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
+		//curl_easy_setopt(curl, CURLOPT_READDATA, &wt);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+		//curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+		res = curl_easy_perform(curl);
+		if(res != CURLE_OK) fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+		/* always cleanup */ 
+		curl_easy_cleanup(curl);
+		/* free the custom headers */ 
+		curl_slist_free_all(hdr);
+	}
+
+	json_object_put(jroot);
+
+	// free the malloc'd memory
+	sml_file_free(file);
+}
+
+int main(int argc, char *argv[]) {
+	// this example assumes that a EDL21 meter sending SML messages via a
+	// serial device. Adjust as needed.
+	int c;
+
+	while ((c = getopt(argc, argv, "+hsv")) != -1) {
+		switch (c) {
+		case 'h':
+			printf("usage: %s [-h] [-s] [-v] device\n", argv[0]);
+			printf("device - serial device of connected power meter e.g. /dev/cu.usbserial, or - for stdin\n");
+			printf("-h - help\n");
+			printf("-s - process only one OBIS data stream (single)\n");
+			printf("-v - verbose\n");
+			exit(0); // exit here
+			break;
+		case 's':
+			sflag = true;
+			break;
+		case 'v':
+			vflag = true;
+			break;
+		case '?':
+			// get a not specified switch, error message is printed by getopt()
+			printf("Use %s -h for help.\n", argv[0]);
+			exit(1); // exit here
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (argc - optind != 1) {
+		printf("error: Arguments mismatch.\nUse %s -h for help.\n", argv[0]);
+		exit(1); // exit here
+	}
+
+	// open serial port
+	int fd = serial_port_open(argv[optind]);
+	if (fd < 0) {
+		// error message is printed by serial_port_open()
+		exit(1);
+	}
+
+	// listen on the serial device, this call is blocking.
+	sml_transport_listen(fd, &transport_receiver);
+	close(fd);
+
+	return 0;
+}

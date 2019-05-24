@@ -1,0 +1,1 @@
+#define	SPLUNK_HEC_KEY	"Authorization: Splunk 00000000-0000-0000-0000-000000000000"
