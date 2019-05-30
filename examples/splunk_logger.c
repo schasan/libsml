@@ -32,7 +32,6 @@
 #include <string.h>
 #include <math.h>
 #include <sys/ioctl.h>
-#include <json/json.h>
 #include <curl/curl.h>
 
 #include <sml/sml_file.h>
@@ -125,6 +124,10 @@ int serial_port_open(const char* device) {
 
 void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 	int i;
+	char msg[512];
+	int msgptr = 0;
+	msgptr += sprintf(&msg[msgptr], "{\"event\": {");
+
 	// the buffer contains the whole message, with transport escape sequences.
 	// these escape sequences are stripped here.
 	sml_file *file = sml_file_parse(buffer + 8, buffer_len - 16);
@@ -135,12 +138,7 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 		sml_file_print(file);
 
 	// read here some values ...
-	if (vflag)
-		printf("OBIS data\n");
-
-	json_object * jroot = json_object_new_object();
-	json_object * jobis = json_object_new_object();
-	json_object_object_add(jroot, "event", jobis);
+	if (vflag) printf("OBIS data\n");
 
 	for (i = 0; i < file->messages_len; i++) {
 		sml_message *message = file->messages[i];
@@ -154,15 +152,16 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 					continue;
 				}
 				if (entry->value->type == SML_TYPE_OCTET_STRING) {
-					char *str, *obis;
-					asprintf(&obis, "%02x-%02x-%02x-%02x-%02x-%02x",
+					char *str;
+					sml_value_to_strhex(entry->value, &str, true);
+					printf("%02x-%02x-%02x-%02x-%02x-%02x: %s\n",
 						entry->obj_name->str[0], entry->obj_name->str[1],
 						entry->obj_name->str[2], entry->obj_name->str[3],
-						entry->obj_name->str[4], entry->obj_name->str[5]);
-					json_object * jdatastring = json_object_new_string(sml_value_to_strhex(entry->value, &str, true));
-					json_object * jdata = json_object_new_object();
-					json_object_object_add(jdata, "data", jdatastring);
-					json_object_object_add(jobis, obis, jdata);
+						entry->obj_name->str[4], entry->obj_name->str[5], str);
+					msgptr += sprintf(&msg[msgptr], "\"%02x-%02x-%02x-%02x-%02x-%02x\":{\"Data\":\"%s\"}",
+						entry->obj_name->str[0], entry->obj_name->str[1],
+						entry->obj_name->str[2], entry->obj_name->str[3],
+						entry->obj_name->str[4], entry->obj_name->str[5], str);
 					free(str);
 				} else if (entry->value->type == SML_TYPE_BOOLEAN) {
 					printf("%d-%d:%d.%d.%d*%d#%s#\n",
@@ -172,50 +171,51 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 						entry->value->data.boolean ? "true" : "false");
 				} else if (((entry->value->type & SML_TYPE_FIELD) == SML_TYPE_INTEGER) ||
 						((entry->value->type & SML_TYPE_FIELD) == SML_TYPE_UNSIGNED)) {
-					json_object * jusage = json_object_new_object();
 					double value = sml_value_to_double(entry->value);
 					int scaler = (entry->scaler) ? *entry->scaler : 0;
 					int prec = -scaler;
-					char *obis;
 
-					if (prec < 0)
-						prec = 0;
+					if (prec < 0) prec = 0;
 					value = value * pow(10, scaler);
-					asprintf(&obis, "%02x-%02x-%02x-%02x-%02x-%02x",
+					printf("%02x-%02x-%02x-%02x-%02x-%02x: %lf",
 						entry->obj_name->str[0], entry->obj_name->str[1],
 						entry->obj_name->str[2], entry->obj_name->str[3],
-						entry->obj_name->str[4], entry->obj_name->str[5]);
-					json_object *jvalue = json_object_new_double(value);
-					json_object_object_add(jusage, "Value", jvalue);
+						entry->obj_name->str[4], entry->obj_name->str[5], value);
+					msgptr += sprintf(&msg[msgptr], "\"%02x-%02x-%02x-%02x-%02x-%02x\":{\"Value\":\"%lf\"",
+						entry->obj_name->str[0], entry->obj_name->str[1],
+						entry->obj_name->str[2], entry->obj_name->str[3],
+						entry->obj_name->str[4], entry->obj_name->str[5], value);
 					char *unit = NULL;
 					if (entry->unit &&  // do not crash on null (unit is optional)
 						(unit = dlms_get_unit((unsigned char) *entry->unit)) != NULL) {
-						json_object *junit = json_object_new_string(unit);
-						json_object_object_add(jusage, "Unit", junit);
+						printf(" %s\n", unit);
+						msgptr += sprintf(&msg[msgptr], ",\"Unit\":\"%s\"}", unit);
+					} else {
+						printf("\n");
+						msgptr += sprintf(&msg[msgptr], "}");
 					}
-					json_object_object_add(jobis, obis, jusage);
 					// flush the stdout puffer, that pipes work without waiting
 					fflush(stdout);
 				}
+				msgptr += sprintf(&msg[msgptr], ",");
 			}
 			if (sflag)
 				exit(0); // processed first message - exit
 		}
 	}
-	// printf("%s\n", json_object_to_json_string(jroot));
+	msgptr += sprintf(&msg[--msgptr], "}}");
+	printf("%s - len: %d\n", msg, msgptr);
+
 	CURL *curl;
 	curl = curl_easy_init();
 	if (curl) {
 		CURLcode res;
 		struct curl_slist *hdr = NULL;
-		struct WriteThis wt;
 
-		wt.readptr = json_object_to_json_string(jroot);
-		wt.sizeleft = strlen(wt.readptr);
 		hdr = curl_slist_append(hdr, SPLUNK_HEC_KEY);
 		curl_easy_setopt(curl, CURLOPT_URL, "https://192.168.5.201:8443/services/collector");
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, wt.readptr);
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, wt.sizeleft);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, msg);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, msgptr);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -226,13 +226,11 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 		//curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 		res = curl_easy_perform(curl);
 		if(res != CURLE_OK) fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-		/* always cleanup */ 
+		// always cleanup
 		curl_easy_cleanup(curl);
-		/* free the custom headers */ 
+		// free the custom headers
 		curl_slist_free_all(hdr);
 	}
-
-	json_object_put(jroot);
 
 	// free the malloc'd memory
 	sml_file_free(file);
