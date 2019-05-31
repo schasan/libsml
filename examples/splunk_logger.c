@@ -33,6 +33,7 @@
 #include <math.h>
 #include <sys/ioctl.h>
 #include <curl/curl.h>
+#include <time.h>
 
 #include <sml/sml_file.h>
 #include <sml/sml_transport.h>
@@ -126,7 +127,11 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 	int i;
 	char msg[512];
 	int msgptr = 0;
-	msgptr += sprintf(&msg[msgptr], "{\"event\": {");
+	struct timespec tp;
+
+	// Take the time
+	clock_gettime(CLOCK_REALTIME, &tp);
+	msgptr += sprintf(&msg[msgptr], "{\"event\": {\"Epochtime\": %ld.%06ld,", tp.tv_sec, tp.tv_nsec/1000);
 
 	// the buffer contains the whole message, with transport escape sequences.
 	// these escape sequences are stripped here.
@@ -158,7 +163,7 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 						entry->obj_name->str[0], entry->obj_name->str[1],
 						entry->obj_name->str[2], entry->obj_name->str[3],
 						entry->obj_name->str[4], entry->obj_name->str[5], str);
-					msgptr += sprintf(&msg[msgptr], "\"%02x-%02x-%02x-%02x-%02x-%02x\":{\"Data\":\"%s\"}",
+					msgptr += sprintf(&msg[msgptr], "\"%02x%02x%02x%02x%02x%02x\":{\"Data\":\"%s\"}",
 						entry->obj_name->str[0], entry->obj_name->str[1],
 						entry->obj_name->str[2], entry->obj_name->str[3],
 						entry->obj_name->str[4], entry->obj_name->str[5], str);
@@ -181,7 +186,7 @@ void transport_receiver(unsigned char *buffer, size_t buffer_len) {
 						entry->obj_name->str[0], entry->obj_name->str[1],
 						entry->obj_name->str[2], entry->obj_name->str[3],
 						entry->obj_name->str[4], entry->obj_name->str[5], value);
-					msgptr += sprintf(&msg[msgptr], "\"%02x-%02x-%02x-%02x-%02x-%02x\":{\"Value\":\"%lf\"",
+					msgptr += sprintf(&msg[msgptr], "\"%02x%02x%02x%02x%02x%02x\":{\"Value\":\"%lf\"",
 						entry->obj_name->str[0], entry->obj_name->str[1],
 						entry->obj_name->str[2], entry->obj_name->str[3],
 						entry->obj_name->str[4], entry->obj_name->str[5], value);
