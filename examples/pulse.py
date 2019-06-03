@@ -4,15 +4,13 @@ import time
 import threading
 import requests
 import json
+from auth import headers
 
 # Zaehler-Variable, global
 Counter = 0
 Calm = 10
 Tic = 0
 url = 'https://192.168.5.201:8443/services/collector'
-headers = {
-  'Authorization': 'Splunk a1aaecc6-898f-48e7-9856-ce39e5e2e662'
-}
 lasttime = time.time()
 
 # Pinreferenz waehlen
@@ -23,7 +21,7 @@ GPIO.setup(18, GPIO.IN, pull_up_down = GPIO.PUD_UP)
 
 def logger(data):
   #print(json.dumps(data))
-  res = requests.post(url, data=json.dumps({'event': data}), headers=headers, verify=False)
+  res = requests.post(url, data=json.dumps({'event': data}), headers=headers(), verify=False)
   if res.status_code != requests.codes.ok:
     print(res.json())
 

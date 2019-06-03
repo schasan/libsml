@@ -1,2 +1,4 @@
 hec_key.h
+auth.py
 splunk_logger
+pulse
