@@ -277,16 +277,19 @@ int main(int argc, char *argv[]) {
 		exit(1); // exit here
 	}
 
-	// open serial port
-	int fd = serial_port_open(argv[optind]);
-	if (fd < 0) {
-		// error message is printed by serial_port_open()
-		exit(1);
-	}
+	while (1) {
+		printf("Open serial port.\n");
+		// open serial port
+		int fd = serial_port_open(argv[optind]);
+		if (fd < 0) {
+			// error message is printed by serial_port_open()
+			exit(1);
+		}
 
-	// listen on the serial device, this call is blocking.
-	sml_transport_listen(fd, &transport_receiver);
-	close(fd);
+		// listen on the serial device, this call is blocking.
+		sml_transport_listen(fd, &transport_receiver);
+		close(fd);
+	}
 
 	return 0;
 }
